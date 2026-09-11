@@ -64,13 +64,15 @@ src/
   analyze_grey_zone.py    # per sample error analysis / EF "grey zone"
   analyze_regression.py   # EF regression results analysis
   compare_models.py       # combined ROC/PR/summary table across all 4 architectures
-  aggregate_seeds.py      # multi-seed mean +/- std aggregation
+  aggregate_seeds.py      # multi-seed mean/std aggregation
 
 scripts/                 # sbatch scripts for CSC Roihu
   run_baseline.sh, run_cnn_lstm.sh, run_r3d.sh, run_swin3d.sh
   run_eda.sh, run_interpretability.sh
   evaluation/             # per-checkpoint full-metric evaluation jobs
+    run_evaluate_seed.sh   # generic per-seed evaluation (any model/seed combo)
   robustness_seeds/       # multi-seed training jobs
+    submit_new_seeds.sh    # submits a batch of new seeds across all 4 models
   augmentation/           # augmented training jobs
   quality_robustness/     # quality degradation evaluation jobs
   regression/             # EF regression training job
@@ -81,9 +83,10 @@ notebooks/
 
 results/
   training/        # *_history.csv / *_test.csv per model, including seed/augmentation/regression variants
-  eda/              # video length + EF distribution, class balance
-  evaluation/       # full metrics, confusion matrices, ROC/PR curves, per-sample predictions
-  robustness/       # multi-seed mean +/- std summaries
+  eda/              # video length + EF distribution (overall and per split), class balance
+  evaluation/       # full metrics, confusion matrices, ROC/PR curves, per-sample predictions,
+                     # for every model and every seed
+  robustness/       # multi-seed mean/std summaries
   ef_threshold/     # EF threshold sensitivity sweep results
   grey_zone/        # per-sample error analysis / grey-zone plots
   quality_robustness/  # image-quality degradation sweep results
@@ -125,19 +128,21 @@ the login node, no GPU or container needed.
 
 | model     | test AUC | test acc | test F1 | epochs |
 |-----------|----------|----------|---------|--------|
-| baseline  | 0.908    | 0.825    | 0.879   | 15 |
+| baseline  | 0.908    | 0.823    | 0.878   | 15 |
 | CNN+LSTM  | 0.900    | 0.861    | 0.915   | 15 |
 | **R3D**   | **0.934**| 0.874    | 0.917   | 12 |
-| Swin3D    | 0.912    | 0.869    | 0.916   | 15 |
+| Swin3D    | 0.912    | 0.867    | 0.914   | 15 |
 
 R3D-18 is the best model overall, Swin3D-T a close second once its training
 collapse was fixed (see Discussion in the thesis for the fix), both clearly
-ahead of the frame-averaging baseline and CNN+LSTM - though CNN+LSTM's
-headline accuracy is misleading (see Phase 3 below).
+ahead of the frame-averaging baseline and CNN+LSTM. CNN+LSTM's headline
+accuracy looks strong on paper but hides a real weakness at the fixed 0.5
+threshold - see Phase 3 and especially Phase 4 below, since a single-seed
+snapshot of this model turned out to be misleading.
 
-## Experiment
+## Experiments (Phases 1-9)
 
-The later phases reuse the same trained checkpoints where possible. 
+The later phases reuse the same trained checkpoints where possible.
 Most require only additional evaluation or analysis of saved predictions rather than retraining.
 
 1. **Baseline reproducibility** (`src/evaluate.py`): full documented
@@ -146,29 +151,46 @@ Most require only additional evaluation or analysis of saved predictions rather 
    models. -> `results/evaluation/*_frozen_record.json`
 
 2. **Dataset analysis** (`src/data/eda.py`), EF distribution (skewness,
-   normality test), class balance at multiple thresholds, video-length
-   distribution, sampling coverage. -> `results/eda/`. EF is notably
-   left-skewed (skewness -1.33); at the 50% threshold the dataset is 22.4%
-   Abnormal / 77.6% Normal.
+   normality test), per-split EF histograms, class balance at multiple
+   thresholds, video-length distribution, sampling coverage.
+   -> `results/eda/`. EF is notably left-skewed (skewness -1.33) and this
+   holds consistently across train/val/test individually; at the 50%
+   threshold the dataset is 22.4% Abnormal / 77.6% Normal.
 
 3. **Complete evaluation outputs** (`src/engine/plots.py`,
    `src/compare_models.py`): ROC curves, PR curves, confusion-matrix
    heatmaps per model, plus a combined 4-model comparison.
-   -> `results/evaluation/`. Finding: CNN+LSTM has the highest raw accuracy
-   but by far the weakest sensitivity to Abnormal cases (0.49), a case
-   study in why accuracy alone is misleading here.
+   -> `results/evaluation/`. On the single default-seed run, CNN+LSTM has
+   the highest raw accuracy but a strikingly weak sensitivity to Abnormal
+   cases (0.49) - a good early case study in why accuracy alone is
+   misleading here. Phase 4 below shows this specific number wasn't
+   actually representative of the model.
 
 4. **Seed robustness** (`src/aggregate_seeds.py`), each model retrained
-   with 2 additional random seeds (3 total), reporting mean +/- std.
-   -> `results/robustness/`. AUC is very stable across seeds (std
-   0.002-0.006 for all 4 models); Accuracy/F1 are noticeably less stable
-   for the baseline specifically (std ~0.02).
+   with 11 additional random seeds (12 total: 42, 123, 2024, 1-9), reporting
+   mean and std separately. -> `results/robustness/`. AUC is stable across
+   seeds for all 4 models (std 0.002-0.007). CNN+LSTM's AUC is the most
+   variable of the four (std 0.007), and running the extra seeds showed its
+   Phase 3 sensitivity number (0.49) was actually its worst draw out of
+   twelve - averaged properly, CNN+LSTM's sensitivity to Abnormal cases
+   (0.725) is close to R3D-18's (0.774), not dramatically lower. The
+   baseline turned out to have its own seed-level quirk: one run (seed 6)
+   picked, by the standard best-validation-AUC checkpoint rule, an epoch
+   where accuracy/F1 didn't match that AUC at all. Re-running that exact
+   seed reproduced the same result, so it's a real, reproducible property
+   of that run and not a crash - it's kept in the stats rather than thrown
+   out, which is why the baseline's F1 std (0.054) looks large compared to
+   the other three models.
 
 5. **Data augmentation** (`src/data/augmentation.py`), small rotation,
-   random-resized-crop, brightness/contrast jitter, applied only to the
-   training split. No flipping (chamber left/right layout is diagnostically
-   meaningful in an A4C view). -> `results/training/*_aug_test.csv`.
-   Helped 3/4 models modestly. For CNN+LSTM, Accuracy/F1 decreased substantially while AUC stayed almost unchanged, suggesting an effect on the classification threshold rather than the ranking of predictions.
+   random-resized-crop (90-100% of frame), brightness/contrast jitter,
+   applied only to the training split. No flipping (chamber left/right
+   layout is diagnostically meaningful in an A4C view).
+   -> `results/training/*_aug_test.csv`. Improved F1 for 3 of the 4
+   models. For CNN+LSTM, accuracy/F1 dropped substantially while AUC
+   stayed almost unchanged, suggesting augmentation shifted its output
+   probabilities relative to the fixed 0.5 threshold rather than actually
+   hurting how well it ranks predictions.
 
 6. **Image-quality robustness** (`src/data/degradation.py`,
    `src/evaluate_quality.py`), controlled, deterministic degradation
@@ -189,7 +211,9 @@ Most require only additional evaluation or analysis of saved predictions rather 
 
 8. **Error analysis / EF "grey zone"** (`src/analyze_grey_zone.py`), bins
    per-sample errors by distance from the 50% boundary.
-   -> `results/grey_zone/`. Error rate is ~40% for videos within 5 EF points of the boundary, compared with <10% (often <2%) for videos 15+ points away. This pattern appears for all four models.
+   -> `results/grey_zone/`. Error rate is ~40% for videos within 5 EF
+   points of the boundary, compared with <10% (often <2%) for videos 15+
+   points away. This pattern appears for all four models.
 
 9. **EF regression** (`src/train_regression.py`,
    `src/analyze_regression.py`); R3D-18 backbone, continuous EF target,
@@ -198,4 +222,7 @@ Most require only additional evaluation or analysis of saved predictions rather 
    classifier derived by thresholding the regression output at 50% matches
    or slightly exceeds the purpose-trained R3D-18 classifier on
    Accuracy/F1/AUC, though with lower sensitivity to Abnormal cases.
-   Regression error does not show the same concentration around the 50% boundary (p=0.15). This suggests that part of the grey-zone effect observed in classification may come from converting continuous EF values into binary labels.
+   Regression error does not show the same concentration around the 50%
+   boundary (p=0.15). This suggests that part of the grey-zone effect
+   observed in classification may come from converting continuous EF
+   values into binary labels.
